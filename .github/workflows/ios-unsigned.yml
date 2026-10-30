@@ -19,6 +19,8 @@ on:
 
 jobs:
   build-ios:
+    # 不用 macos-latest：它指向最新的 macOS 26 镜像，容量少，经常排 15 分钟还抢不到机器。
+    # macos-15 是成熟镜像（Xcode 16.x），Tauri 2 构建没问题。
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -51,6 +53,15 @@ jobs:
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
+
+      # 仓库锁定的 @tauri-apps/cli 版本太老，没有 `ios build --no-sign`（该参数 2.12.x 才有）。
+      # 只在 CI 里升，不改用户的 package.json。
+      - name: Upgrade Tauri CLI (needs --no-sign)
+        run: |
+          set -euo pipefail
+          pnpm add -D @tauri-apps/cli@2.12.4
+          pnpm tauri --version
+          pnpm tauri ios build --help
 
       # 仓库 icons/ 里没有 iOS 的 AppIcon，用 docs/图标.png 现场生成一套。
       # 失败不阻塞：真缺图标时再看这一步日志。
@@ -117,7 +128,7 @@ jobs:
           JM_SHELL: mobile
         run: |
           set -euo pipefail
-          pnpm tauri ios build --no-sign 2>&1 | tee build.log
+          pnpm tauri ios build --no-sign --ignore-version-mismatches 2>&1 | tee build.log
 
       - name: Collect ipa
         run: |
