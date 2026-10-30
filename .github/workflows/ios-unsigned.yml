@@ -29,13 +29,13 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      # 版本由 package.json 的 packageManager 字段决定（pnpm@9.5.0）。
+      # 这里再写 with.version 会让 action-setup 报 "Multiple versions of pnpm specified"
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install Rust (with iOS target)
