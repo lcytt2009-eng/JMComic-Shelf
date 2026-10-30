@@ -1,0 +1,174 @@
+name: ios-unsigned
+
+# 在 GitHub 的 macOS 服务器上把 Tauri 应用编译成「未签名 ipa」，
+# 下载到 Windows 后用 Sideloadly 用自己的 Apple ID 签名安装。
+#
+# 关键点：
+#   1. 前端必须用移动外壳（JM_SHELL=mobile），否则打进去的是桌面版界面
+#   2. 不签名：CODE_SIGNING_ALLOWED=NO，由 Sideloadly 重新签
+#   3. 先 tauri ios init 生成 Xcode 工程，再直接调 xcodebuild
+#      （不用 tauri ios build，因为它要求已配好签名证书）
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "ios-*"
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Rust (with iOS target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-aarch64
+          workspaces: src-tauri -> target
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      # 仓库 icons/ 里没有 iOS 的 AppIcon，用 docs/图标.png 现场生成一套。
+      # 失败也不阻塞：真的缺图标时再看这一步的日志。
+      - name: (optional) regenerate icons incl. iOS
+        continue-on-error: true
+        run: |
+          if [ -f "docs/图标.png" ]; then
+            cp "docs/图标.png" /tmp/appicon.png
+            pnpm tauri icon /tmp/appicon.png
+            ls -la src-tauri/icons/ios 2>/dev/null || true
+          else
+            echo "docs/图标.png 不存在，跳过"
+          fi
+
+      # gen/apple 不在仓库里，必须先 init。CI=true 让它跳过交互提问。
+      - name: Init iOS project
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          pnpm tauri ios init
+          echo "---- gen/apple ----"
+          ls -la src-tauri/gen/apple
+
+      # 给生成的 Info.plist 打补丁（原先放在 scripts/patch-ios-plist.sh，这里内联，少建一个文件）
+      - name: Patch Info.plist (ATS / Files / 竖屏)
+        run: |
+          set -euo pipefail
+          PLIST=$(find src-tauri/gen/apple -name Info.plist -not -path '*/Pods/*' -not -path '*/build/*' | head -n 1)
+          if [ -z "$PLIST" ]; then
+            echo "找不到 Info.plist"; find src-tauri/gen/apple -maxdepth 3; exit 1
+          fi
+          echo "patch: $PLIST"
+
+          pb() { /usr/libexec/PlistBuddy -c "$1" "$PLIST"; }
+          del() { pb "Delete :$1" >/dev/null 2>&1 || true; }
+
+          # 禁漫域名/图床会换、部分走 HTTP，iOS 默认掐断
+          del NSAppTransportSecurity
+          pb "Add :NSAppTransportSecurity dict"
+          pb "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true"
+          pb "Add :NSAppTransportSecurity:NSAllowsArbitraryLoadsInWebContent bool true"
+          pb "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true"
+
+          # 沙盒目录在「文件」App 里可见、可就地打开
+          del UIFileSharingEnabled
+          pb "Add :UIFileSharingEnabled bool true"
+          del LSSupportsOpeningDocumentsInPlace
+          pb "Add :LSSupportsOpeningDocumentsInPlace bool true"
+
+          # 中文展示名
+          del CFBundleDisplayName
+          pb "Add :CFBundleDisplayName string 禁漫书架"
+
+          # 锁竖屏（对齐 Android 的 portrait）
+          del UISupportedInterfaceOrientations
+          pb "Add :UISupportedInterfaceOrientations array"
+          pb "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait"
+
+          # 未使用非豁免加密，省掉上传时的合规问答
+          del ITSAppUsesNonExemptEncryption
+          pb "Add :ITSAppUsesNonExemptEncryption bool false"
+
+          plutil -lint "$PLIST"
+          plutil -p "$PLIST" | grep -E "NSAppTransportSecurity|UIFileSharing|CFBundleDisplayName|ITSAppUses" || true
+
+      # 移动外壳由 vite config 的 JM_SHELL 决定（与 --mode 无关），这里显式指定
+      - name: Build frontend (mobile shell)
+        run: |
+          set -euo pipefail
+          JM_SHELL=mobile pnpm build
+          ls -la dist | head -n 20
+
+      - name: Resolve project & scheme
+        id: proj
+        run: |
+          set -euo pipefail
+          PROJ=$(ls -d src-tauri/gen/apple/*.xcodeproj | head -n 1)
+          echo "xcodeproj: $PROJ"
+          SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "import json,sys; s=json.load(sys.stdin)['project']['schemes']; ios=[x for x in s if 'ios' in x.lower()]; print((ios or s)[0])")
+          echo "scheme: $SCHEME"
+          echo "project=$PROJ" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Build (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${{ steps.proj.outputs.project }}" \
+            -scheme "${{ steps.proj.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/derived \
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build 2>&1 | tee build.log
+
+      - name: Package unsigned ipa
+        run: |
+          set -euo pipefail
+          APP=$(find build/derived/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          echo "app: $APP"
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry jmcomic-shelf-unsigned.ipa Payload)
+          ls -lh out/jmcomic-shelf-unsigned.ipa
+          codesign -dv out/Payload/*.app 2>&1 || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: |
+            out/*.ipa
+            build.log
+          if-no-files-found: warn
