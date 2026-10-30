@@ -21,7 +21,7 @@ jobs:
   build-ios:
     # 不用 macos-latest：它指向最新的 macOS 26 镜像，容量少，经常排 15 分钟还抢不到机器。
     # macos-15 是成熟镜像（Xcode 16.x），Tauri 2 构建没问题。
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 90
 
     steps:
