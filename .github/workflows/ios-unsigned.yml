@@ -19,13 +19,26 @@ on:
 
 jobs:
   build-ios:
-    # 不用 macos-latest：它指向最新的 macOS 26 镜像，容量少，经常排 15 分钟还抢不到机器。
-    # macos-15 是成熟镜像（Xcode 16.x），Tauri 2 构建没问题。
+    # 用 Intel 池子（macos-14 = x86_64）：arm64 池（macos-latest / *-arm64）经常排 15 分钟抢不到机器。
+    # iOS 是交叉编译到 aarch64-apple-ios，Intel 机器编出来的包在 iPhone 上一样跑。
     runs-on: macos-14
     timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
+
+      # macos-14 默认的 Xcode 是 15.4，读不了 tauri 生成的新工程格式（objectVersion 77），
+      # 报 "future Xcode project file format"。镜像里还装了 16.2，切过去即可。
+      - name: Select Xcode 16
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          if [ -d /Applications/Xcode_16.2.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          else
+            sudo xcode-select -s "$(ls -d /Applications/Xcode_1[6-9]*.app /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          xcodebuild -version
 
       - name: Show toolchain
         run: |
